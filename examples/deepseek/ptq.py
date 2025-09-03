@@ -335,6 +335,6 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     model = load_deepseek_model(args.config, args.model_path, args.batch_size)
-    tokenizer = AutoTokenizer.from_pretrained(args.model_path)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
     model = ptq(model, tokenizer, args.quant_cfg, args.batch_size, args.calib_size)
     save_amax_and_quant_config(model, args.output_path, args.enable_fp8_kvcache)

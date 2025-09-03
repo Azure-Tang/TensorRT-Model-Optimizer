@@ -52,6 +52,7 @@ from tqdm import tqdm
 from modelopt.torch.quantization.qtensor import NVFP4QTensor
 
 sys.path.append(str(Path(__file__).resolve().parent / "DeepSeek-V3/inference"))
+print(sys.path)
 from kernel import weight_dequant
 
 
