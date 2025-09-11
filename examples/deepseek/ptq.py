@@ -64,147 +64,25 @@ from modelopt.torch.quantization.utils import (
 from modelopt.torch.utils.dataset_utils import get_dataset_dataloader
 from modelopt.torch.utils.distributed import ParallelState
 
-sys.path.append(str(Path(__file__).resolve().parent / "DeepSeek-V3/inference"))
-import model as deekseep_model
+sys.path.append(str(Path(__file__).resolve().parent))
+import glm4_hf_pp as deekseep_model
 from kernel import act_quant, fp8_gemm, weight_dequant
 
 
 def monkey_patch_deepseek_model():
-    gemm_impl: Literal["bf16", "fp8"] = "bf16"
-    block_size = 128
-
-    def linear(
-        x: torch.Tensor,
-        weight: torch.Tensor,
-        bias: torch.Tensor | None = None,
-        act_quantizer: TensorQuantizer | None = None,
-        weight_quantizer: TensorQuantizer | None = None,
-    ) -> torch.Tensor:
-        if weight.element_size() > 1:
-            if act_quantizer is not None:
-                x = act_quantizer(x)
-            if weight_quantizer is not None:
-                weight = weight_quantizer(weight)
-            return F.linear(x, weight, bias)
-        elif gemm_impl == "bf16":
-            weight = weight_dequant(weight, weight.scale)
-            if act_quantizer is not None:
-                x = act_quantizer(x)
-            if weight_quantizer is not None:
-                weight = weight_quantizer(weight)
-
-            return F.linear(x, weight, bias)
-        else:
-            assert weight_quantizer is None
-            assert act_quantizer is None
-            x, scale = act_quant(x, block_size)
-            y = fp8_gemm(x, scale, weight, weight.scale)
-            if bias is not None:
-                y += bias
-            return y
-
-    class QuantColumnParallelLinear(deekseep_model.ColumnParallelLinear):
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, **kwargs)
-            self._setup()
-
-        def _setup(self):
-            self.input_quantizer = TensorQuantizer()
-            self.weight_quantizer = TensorQuantizer()
-            # Use TP parallel state
-            self._parallel_state = ParallelState(data_parallel_group=-1, tensor_parallel_group=None)
-            self._is_column_parallel = True
-
-            assert is_quantized_column_parallel_linear(self)
-
-        def forward(self, x: torch.Tensor) -> torch.Tensor:
-            y = linear(
-                x,
-                self.weight,
-                self.bias,
-                act_quantizer=self.input_quantizer,
-                weight_quantizer=self.weight_quantizer,
-            )
-            return y
-
-    class QuantRowParallelLinear(deekseep_model.RowParallelLinear):
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, **kwargs)
-            self._setup()
-
-        def _setup(self):
-            self.input_quantizer = TensorQuantizer()
-            self.weight_quantizer = TensorQuantizer()
-            # Use TP parallel state
-            self._parallel_state = ParallelState(data_parallel_group=-1, tensor_parallel_group=None)
-            self._is_row_parallel = True
-
-            assert is_quantized_row_parallel_linear(self)
-
-        def forward(self, x: torch.Tensor) -> torch.Tensor:
-            y = linear(
-                x,
-                self.weight,
-                act_quantizer=self.input_quantizer,
-                weight_quantizer=self.weight_quantizer,
-            )
-            if deekseep_model.world_size > 1:
-                dist.all_reduce(y)
-            if self.bias is not None:
-                y += self.bias
-            return y
-
-    class QuantLinear(deekseep_model.Linear):
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, **kwargs)
-            self._setup()
-
-        def _setup(self):
-            self.input_quantizer = TensorQuantizer()
-            self.weight_quantizer = TensorQuantizer()
-            # No parallel state.
-            self._parallel_state = ParallelState(data_parallel_group=-1, tensor_parallel_group=-1)
-
-            assert not is_quantized_parallel_linear(self)
-
-        def forward(self, x: torch.Tensor) -> torch.Tensor:
-            y = linear(
-                x,
-                self.weight,
-                self.bias,
-                act_quantizer=self.input_quantizer,
-                weight_quantizer=self.weight_quantizer,
-            )
-            return y
-
-    class QuantMLA(deekseep_model.MLA):
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, **kwargs)
-            self._setup()
-
-        def _setup(self):
-            self.kv_bmm_quantizer = TensorQuantizer()
-            self.pe_bmm_quantizer = TensorQuantizer()
-
-    mtq.register(
-        original_cls=deekseep_model.RowParallelLinear,
-        quantized_cls=QuantRowParallelLinear,
-    )
-    mtq.register(
-        original_cls=deekseep_model.ColumnParallelLinear,
-        quantized_cls=QuantColumnParallelLinear,
-    )
-    mtq.register(original_cls=deekseep_model.Linear, quantized_cls=QuantLinear)
-    mtq.register(original_cls=deekseep_model.MLA, quantized_cls=QuantMLA)
+    # This function is specific to the original DeepSeek model and not compatible
+    # with the HuggingFace model structure. The quantization logic would need
+    # to be adapted specifically for the HF model's modules.
+    pass
 
 
-def load_deepseek_model(model_config: str, model_path: str, batch_size: int):
+def load_deepseek_model(model_path: str, batch_size: int):
     """Loads the deepseek model to memory."""
     # get distributed info
     world_size = int(os.getenv("WORLD_SIZE", "1"))
     rank = int(os.getenv("RANK", "0"))
     local_rank = int(os.getenv("LOCAL_RANK", "0"))
-    if world_size > 1:
+    if world_size > 1 and not dist.is_initialized():
         dist.init_process_group("nccl")
         torch.cuda.set_device(local_rank)
 
@@ -212,20 +90,15 @@ def load_deepseek_model(model_config: str, model_path: str, batch_size: int):
     torch.set_default_dtype(torch.bfloat16)
 
     # get config and build model
-    with open(model_config) as f:
-        model_args = deekseep_model.ModelArgs(**json.load(f))
-        model_args.max_batch_size = max(batch_size, model_args.max_batch_size)
-    with torch.device("cuda"):
-        model = deekseep_model.Transformer(model_args)
+    model_args = deekseep_model.ModelArgs(model_path=model_path, max_batch_size=batch_size)
+    # The device is handled internally by the Transformer class now
+    model = deekseep_model.Transformer(model_args)
 
     # monkey path the model defition for qunatization
     monkey_patch_deepseek_model()
 
-    # load model
-    checkpoint_path = os.path.join(model_path, f"model{rank}-mp{world_size}.safetensors")
-    print(f"Loading {checkpoint_path}")
-    load_model(model, checkpoint_path)
-    print(f"Loaded {checkpoint_path}")
+    # load_model is no longer needed as from_pretrained is used inside the new Transformer class
+    print(f"Model loaded via from_pretrained on rank {rank}")
     return model
 
 
@@ -351,14 +224,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--output_path", type=str, required=True, help="target quantization config."
     )
-    parser.add_argument("--batch_size", type=int, default=8, help="batch size for quantization.")
-    parser.add_argument("--calib_size", type=int, default=512, help="samples for calibration.")
-    parser.add_argument("--enable_fp8_kvcache", type=bool, default=True, help="enable fp8 kvcache.")
+    parser.add_argument("--batch_size", type=int, default=1, help="batch size for quantization.")
+    parser.add_argument("--calib_size", type=int, default=1, help="samples for calibration.")
+    parser.add_argument("--enable_fp8_kvcache", action="store_true", help="enable fp8 kvcache.")
     parser.add_argument("--enable_wo_quant", action="store_true", help="enable MLA wo quant.")
     parser.add_argument("--trust_remote_code", action="store_true", help="trust remote code.")
 
     args = parser.parse_args()
-    model = load_deepseek_model(args.config, args.model_path, args.batch_size)
+    model = load_deepseek_model(args.model_path, args.batch_size)
     tokenizer = AutoTokenizer.from_pretrained(
         args.model_path, trust_remote_code=args.trust_remote_code
     )
