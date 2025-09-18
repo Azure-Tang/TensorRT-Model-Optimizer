@@ -66,7 +66,6 @@ from modelopt.torch.utils.distributed import ParallelState  # noqa: F401
 
 sys.path.append(str(Path(__file__).resolve().parent))
 import glm4_hf_pp as deekseep_model
-from kernel import act_quant, fp8_gemm, weight_dequant  # noqa: F401
 
 
 # 定义安全 barrier, 在 NCCL 下传入 device_ids, 兼容旧版本
