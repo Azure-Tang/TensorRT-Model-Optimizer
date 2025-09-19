@@ -61,6 +61,7 @@ class Transformer(nn.Module):
         )
 
         num_layers = config.num_hidden_layers
+        self.config = full_model.config
         # total layers across all ranks (metadata)
         self.total_layers = num_layers
         self.layers_per_rank = (num_layers + self.world_size - 1) // self.world_size

@@ -1,13 +1,16 @@
 import argparse
+import json
 import os
 
 import glm4_hf_pp as deekseep_model
 import torch
 import torch.distributed as dist
+from safetensors.torch import save_file
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
 import modelopt.torch.quantization as mtq
+from modelopt.torch.export.unified_export_hf import _export_hf_checkpoint
 from modelopt.torch.utils.dataset_utils import get_dataset_dataloader
 
 # set python env proxy
@@ -133,14 +136,127 @@ def main():
 
     # mtq.print_quant_summary(model)
 
-    from modelopt.torch.export import export_hf_checkpoint
+    export_dir = "/mnt/data/models/GLM-4.5-tmp-test"
 
-    export_dir = "/data/numa0/downloaded_models/GLM-4.5-Air-nvfp4-tp4-test"
-    with torch.inference_mode():
-        export_hf_checkpoint(
-            model,  # The quantized model.
-            export_dir=export_dir,  # The directory where the exported files will be stored.
-        )
+    # 1. 每个 rank 独立计算自己那部分模型的导出状态字典和量化配置
+    #    _export_hf_checkpoint 内部的 dummy forward pass 需要所有 rank 参与
+    
+    # 1.1. 先修复缺失的 _amax 值 (参考 quantize_to_nvfp4.py 的处理方式)
+    print(f"[Rank {rank}] Fixing missing _amax values...")
+    def fix_missing_amax(model):
+        """修复缺失的 _amax 值，使用合理的默认值"""
+        from modelopt.torch.quantization.nn import TensorQuantizer
+        
+        # 收集所有有效的 amax 值
+        valid_amax_values = []
+        for name, module in model.named_modules():
+            if isinstance(module, TensorQuantizer) and hasattr(module, '_amax') and module._amax is not None:
+                valid_amax_values.append(module._amax.clone())
+        
+        # 如果没有任何有效的 amax 值, 使用默认值
+        if not valid_amax_values:
+            default_amax = torch.tensor(1.0, dtype=torch.float32)
+        else:
+            # 使用所有有效 amax 值的最大值作为默认值
+            default_amax = torch.max(torch.stack(valid_amax_values))
+        
+        # 修复缺失的 _amax
+        fixed_count = 0
+        for name, module in model.named_modules():
+            if isinstance(module, TensorQuantizer):
+                if not hasattr(module, '_amax') or module._amax is None:
+                    module._amax = default_amax.clone().to(next(model.parameters()).device)
+                    fixed_count += 1
+        
+        if fixed_count > 0:
+            print(f"[Rank {rank}] Fixed {fixed_count} missing _amax values "
+                  f"with default value {default_amax.item():.6f}")
+        return fixed_count
+    
+    fix_missing_amax(model)
+
+    print(f"[Rank {rank}] Starting local model export processing...")
+    post_state_dict, hf_quant_config = _export_hf_checkpoint(model, model.config.torch_dtype)
+    print(f"[Rank {rank}] Finished local model export processing.")
+
+    # 2. 同步所有进程, 确保大家都完成了上面的计算
+    dist.barrier()
+    print(f"[Rank {rank}] Barrier after local export processing.")
+
+    # 3. 每个 rank 将自己的 state_dict 保存到独立的分片文件中
+    world_size = dist.get_world_size()
+    # 格式化文件名, 例如 model-00001-of-00002.safetensors
+    shard_file_name = f"model-{rank + 1:05d}-of-{world_size:05d}.safetensors"
+    shard_file_path = os.path.join(export_dir, shard_file_name)
+
+    # rank 0 负责创建目录
+    if rank == 0:
+        os.makedirs(export_dir, exist_ok=True)
+    dist.barrier()  # 确保目录已创建
+
+    print(f"[Rank {rank}] Saving its shard to {shard_file_path}...")
+    # save_file 会处理目录创建, 但为了分布式安全, 最好由 rank 0 创建
+    save_file(post_state_dict, shard_file_path, metadata={"format": "pt"})
+    print(f"[Rank {rank}] Shard saved.")
+
+    # 4. 收集所有 rank 的量化配置和权重 key 列表到 rank 0
+    all_quant_configs = [None] * world_size
+    all_keys = [None] * world_size
+
+    my_keys = list(post_state_dict.keys())
+
+    dist.gather_object(hf_quant_config, all_quant_configs if rank == 0 else None, dst=0)
+    dist.gather_object(my_keys, all_keys if rank == 0 else None, dst=0)
+
+    # 5. 只在 rank 0 上进行合并元数据和保存全局配置文件
+    if rank == 0:
+        print("[Rank 0] Starting to merge metadata and save global configs...")
+
+        # a. 创建 model.safetensors.index.json
+        weight_map = {}
+        for r, key_list in enumerate(all_keys):
+            shard_name = f"model-{r + 1:05d}-of-{world_size:05d}.safetensors"
+            for key in key_list:
+                weight_map[key] = shard_name
+
+        index_json = {"metadata": {}, "weight_map": weight_map}
+        index_json_path = os.path.join(export_dir, "model.safetensors.index.json")
+        with open(index_json_path, "w") as f:
+            json.dump(index_json, f, indent=4)
+        print(f"[Rank 0] Saved model index to {index_json_path}")
+
+        # b. 合并量化配置
+        final_quant_config = all_quant_configs[0]
+        exclude_modules = set(final_quant_config.get("quantization", {}).get("exclude_modules", []))
+        for config in all_quant_configs:
+            if config:
+                mods = config.get("quantization", {}).get("exclude_modules", [])
+                exclude_modules.update(mods)
+        if "quantization" not in final_quant_config:
+            final_quant_config["quantization"] = {}
+        final_quant_config["quantization"]["exclude_modules"] = sorted(exclude_modules)
+
+        # c. 保存原始模型配置和 tokenizer 配置
+        model.config.save_pretrained(export_dir)
+        tokenizer.save_pretrained(export_dir)
+
+        # d. 更新 config.json 以包含量化信息
+        config_path = os.path.join(export_dir, "config.json")
+        with open(config_path) as f:
+            config_data = json.load(f)
+
+        config_data["quantization_config"] = final_quant_config
+
+        with open(config_path, "w") as f:
+            json.dump(config_data, f, indent=4)
+
+        print(f"[Rank 0] Checkpoint successfully saved to {export_dir}")
+
+    # with torch.inference_mode():
+    #     export_hf_checkpoint(
+    #         model,  # The quantized model.
+    #         export_dir=export_dir,  # The directory where the exported files will be stored.
+    #     )
 
     # # ====== 构造输入 ======
     # messages = [
