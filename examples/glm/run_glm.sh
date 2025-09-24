@@ -37,6 +37,7 @@ ENABLE_FP8_KVCACHE=${ENABLE_FP8_KVCACHE:-0}
 ENABLE_WO_QUANT=${ENABLE_WO_QUANT:-0}
 TRUST_REMOTE_CODE=${TRUST_REMOTE_CODE:-1}
 export TOKENIZERS_PARALLELISM=false
+export CUDA_VISIBLE_DEVICES=5,6
 
 if [[ -z "${QUANT_CFG}" ]]; then
   echo "[ERROR] QUANT_CFG is required (must match a config in modelopt.torch.quantization)."

@@ -79,12 +79,15 @@ def main():
     batch_size = 1
     num_samples = 1
 
-    calib_dataset = get_dataset_dataloader(
-        dataset_name="cnn_dailymail",
-        tokenizer=tokenizer,
-        batch_size=batch_size,
-        num_samples=num_samples,
-    )
+    if rank == 0:
+        calib_dataset = get_dataset_dataloader(
+            dataset_name="cnn_dailymail",
+            tokenizer=tokenizer,
+            batch_size=batch_size,
+            num_samples=num_samples,
+        )
+    else:
+        calib_dataset = 0  # 其他 rank 不需要数据集
 
     def calibrate_loop(model):
         rank = int(os.getenv("RANK", "0"))
@@ -93,25 +96,32 @@ def main():
         _dlog("=====enter calibrate_loop====")
 
         if world_size == 1:
+            _dlog("Single GPU mode")
             # Single-GPU case: iterate normally
             for data in tqdm(calib_dataset):
                 model(data["input_ids"])
         # Pipeline-parallel case
         elif rank == 0:
+            _dlog("Multi-GPU mode, rank 0")
             # Rank 0 drives calibration, iterates real data, and broadcasts shape
             for data in tqdm(calib_dataset):
                 tokens = data["input_ids"]
                 shape = torch.tensor(tokens.shape, device=dev, dtype=torch.int64)
+                _dlog(f"Broadcasting shape {shape.tolist()}")
                 dist.broadcast(shape, src=0)
+                _dlog(f"Running forward on real data {tokens.shape}")
                 model(tokens.to(dev))
             # Send stop signal
             stop_signal = torch.tensor([-1, -1], device=dev, dtype=torch.int64)
             dist.broadcast(stop_signal, src=0)
         else:
+            _dlog(f"Multi-GPU mode, rank {rank}")
             # Other ranks receive shape, create dummy tensor, and call forward
             while True:
                 shape = torch.empty(2, device=dev, dtype=torch.int64)
+                _dlog("Receiving shape")
                 dist.broadcast(shape, src=0)
+                _dlog(f"Received shape {shape.tolist()}")
                 bsz, seqlen = shape[0].item(), shape[1].item()
                 if bsz == -1:
                     # Received stop signal
@@ -140,39 +150,46 @@ def main():
 
     # 1. 每个 rank 独立计算自己那部分模型的导出状态字典和量化配置
     #    _export_hf_checkpoint 内部的 dummy forward pass 需要所有 rank 参与
-    
+
     # 1.1. 先修复缺失的 _amax 值 (参考 quantize_to_nvfp4.py 的处理方式)
     print(f"[Rank {rank}] Fixing missing _amax values...")
+
     def fix_missing_amax(model):
         """修复缺失的 _amax 值，使用合理的默认值"""
         from modelopt.torch.quantization.nn import TensorQuantizer
-        
+
         # 收集所有有效的 amax 值
         valid_amax_values = []
         for name, module in model.named_modules():
-            if isinstance(module, TensorQuantizer) and hasattr(module, '_amax') and module._amax is not None:
+            if (
+                isinstance(module, TensorQuantizer)
+                and hasattr(module, "_amax")
+                and module._amax is not None
+            ):
                 valid_amax_values.append(module._amax.clone())
-        
+
         # 如果没有任何有效的 amax 值, 使用默认值
         if not valid_amax_values:
             default_amax = torch.tensor(1.0, dtype=torch.float32)
         else:
             # 使用所有有效 amax 值的最大值作为默认值
             default_amax = torch.max(torch.stack(valid_amax_values))
-        
+
         # 修复缺失的 _amax
         fixed_count = 0
         for name, module in model.named_modules():
             if isinstance(module, TensorQuantizer):
-                if not hasattr(module, '_amax') or module._amax is None:
+                if not hasattr(module, "_amax") or module._amax is None:
                     module._amax = default_amax.clone().to(next(model.parameters()).device)
                     fixed_count += 1
-        
+
         if fixed_count > 0:
-            print(f"[Rank {rank}] Fixed {fixed_count} missing _amax values "
-                  f"with default value {default_amax.item():.6f}")
+            print(
+                f"[Rank {rank}] Fixed {fixed_count} missing _amax values "
+                f"with default value {default_amax.item():.6f}"
+            )
         return fixed_count
-    
+
     fix_missing_amax(model)
 
     print(f"[Rank {rank}] Starting local model export processing...")
