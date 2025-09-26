@@ -26,7 +26,7 @@ DEBUG_PP = os.getenv("DEBUG_PP", "0") == "1"
 
 
 def _dlog(msg: str):
-    if DEBUG_PP or True:
+    if DEBUG_PP:
         r = os.getenv("RANK", "?")
         print(f"[PP][rank {r}] {msg}", flush=True)
 
