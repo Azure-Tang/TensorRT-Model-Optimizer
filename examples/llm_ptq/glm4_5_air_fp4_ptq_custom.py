@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Union
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from tqdm import tqdm
 from huggingface_hub import login
 
 import modelopt.torch.quantization as mtq
@@ -627,7 +628,15 @@ def main():
         print("🔄 Creating forward loop...")
         # show sample length
         print(f"data")
-        forward_loop = create_forward_loop(dataloader=dataloader)
+        # forward_loop = create_forward_loop(dataloader=dataloader)
+        print("🔄 Creating forward loop with KV cache disabled...")
+
+        def forward_loop(model):
+            """Custom forward loop to disable KV cache during calibration."""
+            # model.eval()
+            for batch in tqdm(dataloader):
+                with torch.no_grad():
+                    model(**batch, use_cache=False)
         print("✅ Forward loop created")
         
         # 4. Get quantization configuration
