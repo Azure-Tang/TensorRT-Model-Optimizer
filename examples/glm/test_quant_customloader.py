@@ -256,12 +256,13 @@ def main():
 
     # 3. 每个 rank 将自己的 state_dict 保存到独立的分片文件中
     world_size = dist.get_world_size()
+    local_rank = int(os.getenv("LOCAL_RANK", "0"))
     # 格式化文件名, 例如 model-00001-of-00002.safetensors
     shard_file_name = f"model-{rank + 1:05d}-of-{world_size:05d}.safetensors"
     shard_file_path = os.path.join(export_dir, shard_file_name)
 
-    # rank 0 负责创建目录
-    if rank == 0:
+    # 每台机器的 local rank 0 负责创建目录
+    if local_rank == 0:
         os.makedirs(export_dir, exist_ok=True)
     dist.barrier()  # 确保目录已创建
 
