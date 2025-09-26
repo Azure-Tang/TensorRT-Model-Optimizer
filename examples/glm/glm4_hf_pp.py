@@ -71,29 +71,31 @@ class Transformer(nn.Module):
             f"init: total_layers={self.total_layers}, local_layers=[{self.start_layer},{self.end_layer})"
         )
 
-        # Assign modules to ranks
-        if self.rank == 0:
-            self.embed_tokens = full_model.model.embed_tokens.to(self.device)
+        # Assign modules to ranks with proper naming structure
+        # Create a model wrapper to maintain correct module names
+        self.model = nn.Module()
 
-        self.layers = nn.ModuleList(
-            [
-                full_model.model.layers[i].to(self.device)
-                for i in range(self.start_layer, self.end_layer)
-            ]
-        )
+        if self.rank == 0:
+            self.model.embed_tokens = full_model.model.embed_tokens.to(self.device)
+
+        self.model.layers = nn.ModuleDict()
+        self._layer_order: list[int] = []
+        for layer_idx in range(self.start_layer, self.end_layer):
+            self.model.layers[str(layer_idx)] = full_model.model.layers[layer_idx].to(self.device)
+            self._layer_order.append(layer_idx)
 
         if self.rank == self.world_size - 1:
-            self.norm = full_model.model.norm.to(self.device)
+            self.model.norm = full_model.model.norm.to(self.device)
             self.lm_head = full_model.lm_head.to(self.device)
 
         self.hidden_size = config.hidden_size
         # Only rank 0 computes rotary position embeddings; others receive cos/sin via pipeline
         if self.rank == 0:
-            self.rotary_emb = full_model.model.rotary_emb.to(self.device)
+            self.model.rotary_emb = full_model.model.rotary_emb.to(self.device)
             # rope dimension = 2 * len(inv_freq)
-            self.rope_dim = int(self.rotary_emb.inv_freq.shape[-1] * 2)
+            self.rope_dim = int(self.model.rotary_emb.inv_freq.shape[-1] * 2)
         else:
-            self.rotary_emb = None
+            self.model.rotary_emb = None
             # Deduce rope_dim from config (equals head_dim)
             self.rope_dim = getattr(
                 config, "head_dim", config.hidden_size // config.num_attention_heads
@@ -117,7 +119,7 @@ class Transformer(nn.Module):
 
         # Pipeline execution
         if self.rank == 0:
-            hidden_states = self.embed_tokens(tokens)
+            hidden_states = self.model.embed_tokens(tokens)
             _dlog(f"after embed: hidden_states shape={tuple(hidden_states.shape)}")
         else:
             # Receive hidden_states from the previous rank
@@ -130,7 +132,7 @@ class Transformer(nn.Module):
 
         # Create/receive position embeddings per HF implementation
         if self.rank == 0:
-            cos, sin = self.rotary_emb(hidden_states, position_ids)
+            cos, sin = self.model.rotary_emb(hidden_states, position_ids)
             cos = cos.contiguous()
             sin = sin.contiguous()
             _dlog(f"pos_emb computed on rank0: cos={tuple(cos.shape)}, sin={tuple(sin.shape)}")
@@ -159,7 +161,8 @@ class Transformer(nn.Module):
         position_embeddings = (cos, sin)
 
         # Common processing for all ranks
-        for idx, layer in enumerate(self.layers):
+        for idx, layer_idx in enumerate(self._layer_order):
+            layer = self.model.layers[str(layer_idx)]
             hidden_states = layer(
                 hidden_states,
                 attention_mask=attention_mask,
@@ -170,12 +173,12 @@ class Transformer(nn.Module):
                 use_cache=False,
                 position_embeddings=position_embeddings,
             )
-            if (idx == 0 or idx == len(self.layers) - 1) and DEBUG_PP:
-                _dlog(f"after layer {self.start_layer + idx}: h={tuple(hidden_states.shape)}")
+            if (idx == 0 or idx == len(self._layer_order) - 1) and DEBUG_PP:
+                _dlog(f"after layer {layer_idx}: h={tuple(hidden_states.shape)}")
 
         if self.rank == self.world_size - 1:
             # Final rank computes logits and returns them
-            hidden_states = self.norm(hidden_states)
+            hidden_states = self.model.norm(hidden_states)
             logits = self.lm_head(hidden_states)
             _dlog(f"final logits shape={tuple(logits.shape)}")
             return logits
