@@ -118,25 +118,30 @@ def main():
 
     if rank == 0:
         if args.dataset_type == "custom":
-            print(f"Using custom dataset from {args.custom_data_path}")
+            _dlog(f"Using custom dataset from {args.custom_data_path}")
             calib_dataset = create_custom_dataloader(
                 data_path=args.custom_data_path,
                 tokenizer=tokenizer,
                 batch_size=batch_size,
                 num_samples=num_samples,
-                max_length=args.max_sample_length,
+                max_sample_length=args.max_sample_length,
                 calibration_mode=args.calibration_mode,
+                device=model.device,
             )
         else:
+            _dlog(f"Using standard dataset {args.dataset_name}")
             calib_dataset = get_dataset_dataloader(
                 dataset_name="cnn_dailymail",
                 tokenizer=tokenizer,
                 batch_size=batch_size,
                 num_samples=num_samples,
             )
-        print(f"Calib dataset created on rank {rank}, length: {len(calib_dataset)}")
+        _dlog(f"Calib dataset created on rank {rank}, length: {len(calib_dataset)}")
     else:
         calib_dataset = 0  # 其他 rank 不需要数据集
+
+    _dlog("Ready to start calibration")
+    dist.barrier()  # 确保所有进程在此同步
 
     def calibrate_loop(model):
         rank = int(os.getenv("RANK", "0"))
@@ -251,12 +256,13 @@ def main():
 
     # 3. 每个 rank 将自己的 state_dict 保存到独立的分片文件中
     world_size = dist.get_world_size()
+    local_rank = int(os.getenv("LOCAL_RANK", "0"))
     # 格式化文件名, 例如 model-00001-of-00002.safetensors
     shard_file_name = f"model-{rank + 1:05d}-of-{world_size:05d}.safetensors"
     shard_file_path = os.path.join(export_dir, shard_file_name)
 
-    # rank 0 负责创建目录
-    if rank == 0:
+    # 每台机器的 local rank 0 负责创建目录
+    if local_rank == 0:
         os.makedirs(export_dir, exist_ok=True)
     dist.barrier()  # 确保目录已创建
 
