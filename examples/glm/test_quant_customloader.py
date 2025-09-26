@@ -118,25 +118,30 @@ def main():
 
     if rank == 0:
         if args.dataset_type == "custom":
-            print(f"Using custom dataset from {args.custom_data_path}")
+            _dlog(f"Using custom dataset from {args.custom_data_path}")
             calib_dataset = create_custom_dataloader(
                 data_path=args.custom_data_path,
                 tokenizer=tokenizer,
                 batch_size=batch_size,
                 num_samples=num_samples,
-                max_length=args.max_sample_length,
+                max_sample_length=args.max_sample_length,
                 calibration_mode=args.calibration_mode,
+                device=model.device,
             )
         else:
+            _dlog(f"Using standard dataset {args.dataset_name}")
             calib_dataset = get_dataset_dataloader(
                 dataset_name="cnn_dailymail",
                 tokenizer=tokenizer,
                 batch_size=batch_size,
                 num_samples=num_samples,
             )
-        print(f"Calib dataset created on rank {rank}, length: {len(calib_dataset)}")
+        _dlog(f"Calib dataset created on rank {rank}, length: {len(calib_dataset)}")
     else:
         calib_dataset = 0  # 其他 rank 不需要数据集
+
+    _dlog("Ready to start calibration")
+    dist.barrier()  # 确保所有进程在此同步
 
     def calibrate_loop(model):
         rank = int(os.getenv("RANK", "0"))
