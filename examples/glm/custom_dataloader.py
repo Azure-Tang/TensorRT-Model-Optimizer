@@ -54,7 +54,7 @@ class CustomCalibrationDataset(Dataset):
 
         if data_path.endswith(".tar"):
             print(f"   Extracting tar file: {data_path}")
-            temp_dir = tempfile.mkdtemp(dir="/mnt/data")
+            temp_dir = tempfile.mkdtemp(dir="/tmp")
 
             with tarfile.open(data_path, "r") as tar:
                 tar.extractall(temp_dir)
