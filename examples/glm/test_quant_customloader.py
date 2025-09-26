@@ -5,6 +5,7 @@ import os
 import glm4_hf_pp as deekseep_model
 import torch
 import torch.distributed as dist
+from custom_dataloader import create_custom_dataloader
 from safetensors.torch import save_file
 from tqdm import tqdm
 from transformers import AutoTokenizer
@@ -12,12 +13,6 @@ from transformers import AutoTokenizer
 import modelopt.torch.quantization as mtq
 from modelopt.torch.export.unified_export_hf import _export_hf_checkpoint
 from modelopt.torch.utils.dataset_utils import get_dataset_dataloader
-from custom_dataloader import create_custom_dataloader
-
-# set python env proxy
-os.environ["http_proxy"] = "http://117.133.60.227:20181"
-os.environ["https_proxy"] = "http://117.133.60.227:20181"
-os.environ["ALL_PROXY"] = "http://117.133.60.227:20181"
 
 rank_env = os.getenv("RANK", None)
 DEBUG_PP = os.getenv("DEBUG_PP", "0") == "1"
@@ -52,14 +47,13 @@ def load_deepseek_model(model_path: str, batch_size: int):
 
 
 def main():
-    model_name = "/mnt/data/models/GLM-4.5-Air-Test/"
-    # model_name = "zai-org/GLM-4.5-Air"
+    model_name = "zai-org/GLM-4.5"
 
     parser = argparse.ArgumentParser("HF GLM4-MoE wrapper demo: load and generate")
     parser.add_argument(
         "--model_path",
         type=str,
-        default="/mnt/data/models/GLM-4.5-Air-Test/",
+        default="zai-org/GLM-4.5",
         help="HuggingFace model path or repo id",
     )
     parser.add_argument("--prompt", type=str, default="你好, GLM-4.5! 请用一句话介绍你自己.")
@@ -68,6 +62,13 @@ def main():
         "--do_sample", action="store_true", help="use multinomial sampling instead of greedy"
     )
     parser.add_argument("--temperature", type=float, default=1.0, help="temperature for sampling")
+    # save path
+    parser.add_argument(
+        "--export_dir",
+        type=str,
+        default="/data/numa0/downloaded_models/glm4-5-nvfp4-calib",
+        help="Directory to save the exported checkpoint and configs",
+    )
     # Dataset parameters
     parser.add_argument(
         "--dataset_type",
@@ -85,8 +86,8 @@ def main():
     parser.add_argument(
         "--custom_data_path",
         type=str,
-        default=None,
-        help="Custom data file path (used when dataset_type=custom), supports .tar, .jsonl, .json, .pkl",
+        default="/data/numa0/zbz2/primary_synced/data_cal/glm4p5-calibration.jsonl.tar",
+        help="Custom data file path (used when dataset_type=custom)",
     )
     parser.add_argument(
         "--calibration_mode",
@@ -99,7 +100,7 @@ def main():
     # Calibration parameters
     parser.add_argument("--batch_size", type=int, default=1, help="Batch size")
     parser.add_argument(
-        "--calib_samples", type=int, default=10000, help="Number of calibration samples"
+        "--calib_samples", type=int, default=10000000, help="Number of calibration samples"
     )
     parser.add_argument("--max_sample_length", type=int, default=512, help="Maximum sample length")
 
@@ -112,17 +113,27 @@ def main():
 
     config = mtq.NVFP4_DEFAULT_CFG
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    batch_size = 1
-    num_samples = 1
+    batch_size = args.batch_size
+    num_samples = args.calib_samples
 
     if rank == 0:
-        # calib_dataset = get_dataset_dataloader(
-        #     dataset_name="cnn_dailymail",
-        #     tokenizer=tokenizer,
-        #     batch_size=batch_size,
-        #     num_samples=num_samples,
-        # )
-        calib_dataset = create_custom_dataloader(args, tokenizer)
+        if args.dataset_type == "custom":
+            print(f"Using custom dataset from {args.custom_data_path}")
+            calib_dataset = create_custom_dataloader(
+                data_path=args.custom_data_path,
+                tokenizer=tokenizer,
+                batch_size=batch_size,
+                num_samples=num_samples,
+                max_length=args.max_sample_length,
+                calibration_mode=args.calibration_mode,
+            )
+        else:
+            calib_dataset = get_dataset_dataloader(
+                dataset_name="cnn_dailymail",
+                tokenizer=tokenizer,
+                batch_size=batch_size,
+                num_samples=num_samples,
+            )
         print(f"Calib dataset created on rank {rank}, length: {len(calib_dataset)}")
     else:
         calib_dataset = 0  # 其他 rank 不需要数据集
@@ -184,7 +195,7 @@ def main():
 
     # mtq.print_quant_summary(model)
 
-    export_dir = "/mnt/data/models/GLM-4.5-tmp-test"
+    export_dir = args.export_dir + f"{num_samples}-samples"
 
     # 1. 每个 rank 独立计算自己那部分模型的导出状态字典和量化配置
     #    _export_hf_checkpoint 内部的 dummy forward pass 需要所有 rank 参与

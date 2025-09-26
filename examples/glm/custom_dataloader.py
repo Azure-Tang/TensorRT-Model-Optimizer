@@ -8,19 +8,15 @@ Supported dataset formats:
 2. Custom dialogue datasets: formats containing ipt_text, ans_text, concat_ids and other fields
 """
 
-import argparse
 import json
 import os
 import pickle
 import tarfile
 import tempfile
-import time
-from pathlib import Path
 
 import torch
-from huggingface_hub import login
 from torch.utils.data import DataLoader, Dataset
-from transformers import AutoModelForCausalLM, AutoTokenizer
+
 
 class CustomCalibrationDataset(Dataset):
     """Custom format calibration dataset"""
@@ -28,7 +24,7 @@ class CustomCalibrationDataset(Dataset):
     def __init__(
         self,
         data_path: str,
-        tokenizer,
+        tokenizer=None,
         max_length: int = 512,
         num_samples: int | None = None,
         calibration_mode: str = "full",
@@ -58,7 +54,7 @@ class CustomCalibrationDataset(Dataset):
 
         if data_path.endswith(".tar"):
             print(f"   Extracting tar file: {data_path}")
-            temp_dir = tempfile.mkdtemp()
+            temp_dir = tempfile.mkdtemp(dir="/mnt/data")
 
             with tarfile.open(data_path, "r") as tar:
                 tar.extractall(temp_dir)
