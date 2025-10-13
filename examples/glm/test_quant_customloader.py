@@ -139,6 +139,11 @@ def main():
         _dlog(f"Calib dataset created on rank {rank}, length: {len(calib_dataset)}")
     else:
         calib_dataset = 0  # 其他 rank 不需要数据集
+        import time
+        _dlog("sleep to wait rank 0 to finish dataset creation")
+
+        # sleep 20min to wait for rank 0 to finish dataset creation
+        time.sleep(3 * 60)
 
     _dlog("Ready to start calibration")
     dist.barrier()  # 确保所有进程在此同步
